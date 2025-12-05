@@ -51,8 +51,13 @@ class QuotationRequest(BaseModel):
     order_lines: list[OrderLine]
 
 
-class DeliveryProposal(BaseModel):
-    new_date: datetime
+class ShippingMethodRequest(BaseModel):
+    shipping_method: str  # "home_delivery" ou "pickup"
+
+
+class DeliveryDateRequest(BaseModel):
+    delivery_date: str  # Format: DD/MM/YYYY (ex: "05/12/2025")
+
 
 
 app = FastAPI()
@@ -212,7 +217,7 @@ def _resolve_portal_url(
 # ---------------------------------------------------------------------------
 # Phase 1 – Setup and References
 # ---------------------------------------------------------------------------
-@app.get("/get-status")
+@app.get("/get-status", tags=["System"])
 def get_status():
     """Return the current Odoo connection status."""
     try:
@@ -230,7 +235,7 @@ def get_status():
 
 
 
-@app.get("/customers/list")
+@app.get("/customers/list", tags=["Customers"])
 def list_customers(format: str = "standard", customer_type: str = "all"):
     """
     List customers available for sales documents.
@@ -315,7 +320,7 @@ def list_customers(format: str = "standard", customer_type: str = "all"):
 
 
 
-@app.get("/customers/by-type/{customer_type}")
+@app.get("/customers/by-type/{customer_type}", tags=["Customers"])
 def list_customers_by_type(customer_type: str, format: str = "standard"):
     """List customers filtered by type (individual or company)."""
     valid_types = {"individual", "company"}
@@ -360,7 +365,7 @@ def list_customers_by_type(customer_type: str, format: str = "standard"):
     return _success(f"Customers of type '{customer_type}' retrieved", {"customers": customers})
 
 
-@app.get("/products/list")
+@app.get("/products/list", tags=["Products"])
 def list_products(format: str = "standard", filter_cars: bool = True, filter_services: bool = False):
     """
     List salable products.
@@ -397,14 +402,24 @@ def list_products(format: str = "standard", filter_cars: bool = True, filter_ser
         
         # Filtrage selon le type demandé
         is_car = default_code.startswith("CAR-") if default_code else False
-        is_service = default_code.startswith("SRV-") if default_code else False
+        is_service = default_code.startswith("SERV-") if default_code else False
         
-        if filter_cars and not filter_services:
-            if not is_car:
-                continue
-        elif filter_services and not filter_cars:
-            if not is_service:
-                continue
+        # Déterminer si le produit doit être inclus
+        if filter_cars and filter_services:
+            # Les deux filtres actifs → inclure véhicules OU services
+            include = is_car or is_service
+        elif filter_cars and not filter_services:
+            # Seulement véhicules
+            include = is_car
+        elif not filter_cars and filter_services:
+            # Seulement services
+            include = is_service
+        else:
+            # Aucun filtre actif → ne rien inclure
+            include = False
+        
+        if not include:
+            continue
         
         # Extraction de la catégorie
         categ = record.get("categ_id")
@@ -442,7 +457,7 @@ def list_products(format: str = "standard", filter_cars: bool = True, filter_ser
     return _success("Products retrieved", {"products": products})
 
 
-@app.get("/customers/{customer_id}")
+@app.get("/customers/{customer_id}", tags=["Customers"])
 def get_customer(customer_id: int):
     """Retrieve a single customer details."""
     _ensure_positive(customer_id, "customer_id")
@@ -461,7 +476,7 @@ def get_customer(customer_id: int):
 # ---------------------------------------------------------------------------
 from typing import Optional
 
-@app.post("/saleorders/quotation")
+@app.post("/saleorders/quotation", tags=["Quotations"])
 def create_quotation(
     format: str = "standard",
     customer_id: Optional[int] = None,
@@ -613,7 +628,7 @@ def create_quotation(
         }
     }
 
-@app.post("/saleorders/{order_id}/cancel")
+@app.post("/saleorders/{order_id}/cancel", tags=["Sales Orders"])
 def cancel_sale_order(order_id: int):
     """Cancel a draft or confirmed sale order."""
     _ensure_positive(order_id, "order_id")
@@ -651,7 +666,7 @@ def cancel_sale_order(order_id: int):
     return _success("Sale order cancelled", {"order_id": order_id, "state": "cancel"})
 
 
-@app.post("/saleorders/{order_id}/confirm")
+@app.post("/saleorders/{order_id}/confirm", tags=["Sales Orders"])
 def confirm_sale_order(order_id: int):
     """Confirm a quotation so it becomes a sale order."""
     _ensure_positive(order_id, "order_id")
@@ -676,7 +691,7 @@ def confirm_sale_order(order_id: int):
 
 
 
-@app.get("/saleorders/{customer_id}")
+@app.get("/saleorders/{customer_id}", tags=["Sales Orders"])
 def list_customer_sale_orders(customer_id: int):
     """List sale orders belonging to a specific customer."""
     _ensure_positive(customer_id, "customer_id")
@@ -703,72 +718,252 @@ def list_customer_sale_orders(customer_id: int):
 # ---------------------------------------------------------------------------
 # Phase 3 – Delivery Management
 # ---------------------------------------------------------------------------
-@app.get("/saleorders/{order_id}/delivery-options")
-def list_delivery_options(order_id: int):
-    """List delivery methods that can be applied to a sale order."""
+@app.post("/saleorders/{order_id}/shipping-method", tags=["Delivery"])
+def set_shipping_method(order_id: int, payload: ShippingMethodRequest):
+    """Add or update shipping method for a sale order (home_delivery or pickup)."""
     _ensure_positive(order_id, "order_id")
     models = _models()
+    
+    # Valider le choix
+    valid_methods = {"home_delivery", "pickup"}
+    method_choice = payload.shipping_method.lower()
+    
+    if method_choice not in valid_methods:
+        _http_error(
+            status.HTTP_400_BAD_REQUEST,
+            f"Invalid shipping method. Must be 'home_delivery' or 'pickup', got '{payload.shipping_method}'"
+        )
+    
+    # Mapper le choix vers le nom du carrier dans Odoo
+    carrier_name_map = {
+        "home_delivery": "Home Delivery",
+        "pickup": "Pick-Up"
+    }
+    carrier_name = carrier_name_map[method_choice]
+    
+    # Vérifier que la commande existe et récupérer le shipping_weight
+    order = _fetch_single_record(
+        models,
+        "sale.order",
+        order_id,
+        fields=["name", "state", "carrier_id", "amount_total", "shipping_weight"],
+        not_found_detail=f"Sale order {order_id} not found",
+    )
+    
+    # Récupérer le poids de la commande (en kg)
+    shipping_weight = order.get("shipping_weight", 0.0)
+
+    
+    # Chercher le carrier par nom
     try:
-        carriers = models.execute_kw(
+        carrier_ids = models.execute_kw(
             DB,
             UID,
             PW,
             "delivery.carrier",
-            "search_read",
-            [[]],
-            {"fields": ["id", "name", "fixed_price", "delivery_type", "product_id"]},
+            "search",
+            [[("name", "=", carrier_name)]],
+            {"limit": 1},
         )
     except xmlrpc.client.Fault as fault:
         fault_string = getattr(fault, "faultString", str(fault))
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while listing delivery options: {fault_string}")
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching carrier: {fault_string}")
     except Exception as err:
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while listing delivery options: {err}")
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching carrier: {err}")
+    
+    if not carrier_ids:
+        _http_error(
+            status.HTTP_404_NOT_FOUND,
+            f"Carrier '{carrier_name}' not found in Odoo. Please create it first in Inventory → Configuration → Delivery → Shipping Methods"
+        )
+    
+    carrier_id = carrier_ids[0]
+    
+    # Récupérer les infos du carrier
 
-    options = [
-        {
-            "id": carrier.get("id"),
-            "name": carrier.get("name"),
-            "price": carrier.get("fixed_price", 0.0),
-            "type": carrier.get("delivery_type"),
-            "product": carrier.get("product_id")[1] if carrier.get("product_id") else None,
-        }
-        for carrier in carriers
-    ]
-    return _success("Delivery options retrieved", {"order_id": order_id, "delivery_methods": options})
-
-
-@app.post("/deliveries/{picking_id}/propose-date")
-def propose_delivery_date(picking_id: int, payload: DeliveryProposal):
-    """Propose a new delivery date for a picking."""
-    _ensure_positive(picking_id, "picking_id")
-    models = _models()
-    picking = _fetch_single_record(
+    carrier = _fetch_single_record(
         models,
-        "stock.picking",
-        picking_id,
-        fields=["scheduled_date", "state"],
-        not_found_detail=f"Delivery picking {picking_id} not found",
+        "delivery.carrier",
+        carrier_id,
+        fields=["id", "name", "fixed_price", "delivery_type", "product_id"],
+        not_found_detail=f"Delivery carrier {carrier_id} not found",
     )
-
-    state = picking.get("state")
-    if state not in {"assigned", "waiting", "confirmed"}:
+    
+    # Vérifier que le carrier a un produit associé
+    carrier_product = carrier.get("product_id")
+    if not carrier_product:
         _http_error(
             status.HTTP_400_BAD_REQUEST,
-            f"Delivery {picking_id} cannot be rescheduled from state '{state}'",
+            f"Carrier '{carrier.get('name')}' has no product configured. Please configure it in Odoo first."
         )
+    
+    carrier_product_id = carrier_product[0] if isinstance(carrier_product, list) else carrier_product
+    
+    # Mettre à jour le carrier de la commande
+    try:
+        models.execute_kw(
+            DB,
+            UID,
+            PW,
+            "sale.order",
+            "write",
+            [[order_id], {"carrier_id": carrier_id}],
+        )
+        
+        # Supprimer les anciennes lignes de livraison
+        existing_delivery_lines = models.execute_kw(
+            DB,
+            UID,
+            PW,
+            "sale.order.line",
+            "search",
+            [["&", ("order_id", "=", order_id), ("is_delivery", "=", True)]],
+        )
+        
+        if existing_delivery_lines:
+            models.execute_kw(
+                DB,
+                UID,
+                PW,
+                "sale.order.line",
+                "unlink",
+                [existing_delivery_lines],
+            )
+        
+        # Calculer le prix de livraison selon les règles du carrier
+        # Pour "Based on Rules": CHF 800 (fixed) + (weight × CHF 1.00)
+        shipping_price = carrier.get("fixed_price", 0.0)
+        
+        # Si c'est "Home Delivery" avec règles de poids
+        if method_choice == "home_delivery" and shipping_weight > 0:
+            # Règle: CHF 800 + (poids × CHF 1.00)
+            base_price = 800.0
+            price_per_kg = 1.0
+            shipping_price = base_price + (shipping_weight * price_per_kg)
+        
+        models.execute_kw(
 
-    new_dt = payload.new_date
-    if new_dt.tzinfo is not None:
-        new_dt_utc = new_dt.astimezone(timezone.utc)
-        new_dt_naive = new_dt_utc.replace(tzinfo=None)
-        if new_dt_utc <= datetime.now(timezone.utc):
-            _http_error(status.HTTP_400_BAD_REQUEST, "new_date must be set in the future")
-    else:
-        new_dt_naive = new_dt
-        if new_dt_naive <= datetime.utcnow():
-            _http_error(status.HTTP_400_BAD_REQUEST, "new_date must be set in the future")
+            DB,
+            UID,
+            PW,
+            "sale.order.line",
+            "create",
+            [{
+                "order_id": order_id,
+                "product_id": carrier_product_id,
+                "product_uom_qty": 1.0,
+                "price_unit": shipping_price,
+                "is_delivery": True,
+                "name": f"Delivery: {carrier.get('name')}",
+            }],
+        )
+        
+        # Récupérer la commande mise à jour
+        updated_order = models.execute_kw(
+            DB,
+            UID,
+            PW,
+            "sale.order",
+            "read",
+            [[order_id]],
+            {"fields": ["amount_total", "carrier_id"]},
+        )
+        
+        calculated_price = shipping_price
+        
+    except xmlrpc.client.Fault as fault:
+        fault_string = getattr(fault, "faultString", str(fault))
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while setting shipping method: {fault_string}")
+    except Exception as err:
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while setting shipping method: {err}")
 
-    new_date_str = new_dt_naive.strftime("%Y-%m-%d %H:%M:%S")
+
+
+
+
+
+    
+    order_data = updated_order[0] if updated_order else {}
+    
+    # Utiliser le prix calculé par le wizard
+    shipping_cost = calculated_price
+    
+    data = {
+        "order_id": order_id,
+        "shipping_method": method_choice,
+        "carrier_id": carrier_id,
+        "carrier_name": carrier.get("name"),
+        "shipping_cost": shipping_cost,
+        "total_amount": order_data.get("amount_total", order.get("amount_total")),
+    }
+    return _success("Shipping method added", data)
+
+
+
+
+
+@app.post("/saleorders/{order_id}/delivery-date", tags=["Delivery"])
+def set_delivery_date(order_id: int, payload: DeliveryDateRequest):
+    """Set delivery date for a sale order (format: DD/MM/YYYY)."""
+    _ensure_positive(order_id, "order_id")
+    models = _models()
+    
+    # Vérifier que la commande existe
+    order = _fetch_single_record(
+        models,
+        "sale.order",
+        order_id,
+        fields=["name", "state"],
+        not_found_detail=f"Sale order {order_id} not found",
+    )
+    
+    # Valider et convertir le format de date DD/MM/YYYY vers YYYY-MM-DD HH:MM:SS
+    try:
+        # Parser la date au format DD/MM/YYYY
+        date_parts = payload.delivery_date.split("/")
+        if len(date_parts) != 3:
+            _http_error(status.HTTP_400_BAD_REQUEST, "Invalid date format. Expected DD/MM/YYYY (ex: 05/12/2025)")
+        
+        day, month, year = date_parts
+        # Créer un objet datetime
+        delivery_datetime = datetime(int(year), int(month), int(day), 10, 0, 0)
+        
+        # Vérifier que la date est dans le futur
+        if delivery_datetime <= datetime.now():
+            _http_error(status.HTTP_400_BAD_REQUEST, "Delivery date must be in the future")
+        
+        # Convertir au format Odoo
+        odoo_date_str = delivery_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        
+    except ValueError as e:
+        _http_error(status.HTTP_400_BAD_REQUEST, f"Invalid date format: {str(e)}. Expected DD/MM/YYYY")
+    
+    # Trouver le picking associé à cette commande
+    try:
+        picking_ids = models.execute_kw(
+            DB,
+            UID,
+            PW,
+            "stock.picking",
+            "search",
+            [["&", ("sale_id", "=", order_id), ("state", "in", ["draft", "assigned", "waiting", "confirmed"])]],
+            {"limit": 1},
+        )
+    except xmlrpc.client.Fault as fault:
+        fault_string = getattr(fault, "faultString", str(fault))
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching delivery: {fault_string}")
+    except Exception as err:
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching delivery: {err}")
+    
+    if not picking_ids:
+        _http_error(
+            status.HTTP_404_NOT_FOUND,
+            f"No delivery found for sale order {order_id}. Please confirm the order first.",
+        )
+    
+    picking_id = picking_ids[0]
+    
+    # Mettre à jour la scheduled_date du picking
     try:
         models.execute_kw(
             DB,
@@ -776,128 +971,139 @@ def propose_delivery_date(picking_id: int, payload: DeliveryProposal):
             PW,
             "stock.picking",
             "write",
-            [[picking_id], {"scheduled_date": new_date_str}],
+            [[picking_id], {"scheduled_date": odoo_date_str}],
         )
     except xmlrpc.client.Fault as fault:
         fault_string = getattr(fault, "faultString", str(fault))
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while proposing delivery date: {fault_string}")
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while updating delivery date: {fault_string}")
     except Exception as err:
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while proposing delivery date: {err}")
-
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while updating delivery date: {err}")
+    
     data = {
+        "order_id": order_id,
+        "delivery_date": payload.delivery_date,
+        "scheduled_date_odoo": odoo_date_str,
         "picking_id": picking_id,
-        "old_date": picking.get("scheduled_date"),
-        "new_date": new_date_str,
-        "state": state,
     }
-    return _success("Delivery date proposed", data)
+    return _success("Delivery date updated", data)
 
 
-@app.post("/deliveries/{picking_id}/validate")
-def validate_delivery(picking_id: int):
-    """Validate a delivery picking."""
-    _ensure_positive(picking_id, "picking_id")
-    models = _models()
-    picking = _fetch_single_record(
-        models,
-        "stock.picking",
-        picking_id,
-        fields=["scheduled_date", "state"],
-        not_found_detail=f"Delivery picking {picking_id} not found",
-    )
-
-    state = picking.get("state")
-    if state not in {"assigned", "waiting", "confirmed"}:
-        _http_error(
-            status.HTTP_400_BAD_REQUEST,
-            f"Delivery {picking_id} cannot be validated from state '{state}'",
-        )
-
-    try:
-        result = models.execute_kw(
-            DB,
-            UID,
-            PW,
-            "stock.picking",
-            "button_validate",
-            [[picking_id]],
-        )
-        refreshed = models.execute_kw(
-            DB,
-            UID,
-            PW,
-            "stock.picking",
-            "read",
-            [[picking_id]],
-            {"fields": ["scheduled_date", "state"]},
-        )
-    except xmlrpc.client.Fault as fault:
-        fault_string = getattr(fault, "faultString", str(fault))
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while validating delivery: {fault_string}")
-    except Exception as err:
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while validating delivery: {err}")
-
-    updated = refreshed[0] if refreshed else {}
-    data = {
-        "picking_id": picking_id,
-        "state": updated.get("state", state),
-        "scheduled_date": updated.get("scheduled_date", picking.get("scheduled_date")),
-        "result": result,
-    }
-    return _success("Delivery validated", data)
-
-
-@app.get("/saleorders/{order_id}/deliveries")
-def list_sale_order_deliveries(order_id: int):
-    """List deliveries associated with a specific sale order."""
+@app.get("/saleorders/{order_id}/delivery-summary", tags=["Delivery"])
+def get_delivery_summary(order_id: int):
+    """Get delivery summary for a sale order."""
     _ensure_positive(order_id, "order_id")
     models = _models()
+    
+    # Récupérer les infos de la commande
+    order = _fetch_single_record(
+        models,
+        "sale.order",
+        order_id,
+        fields=["name", "state", "carrier_id", "amount_total", "amount_untaxed"],
+        not_found_detail=f"Sale order {order_id} not found",
+    )
+    
+    # Récupérer le nom du carrier et le prix de livraison
+    carrier_name = None
+    shipping_cost = 0.0
+    
+    carrier_data = order.get("carrier_id")
+    if carrier_data:
+        carrier_id = carrier_data[0] if isinstance(carrier_data, list) else carrier_data
+        try:
+            carrier = models.execute_kw(
+                DB,
+                UID,
+                PW,
+                "delivery.carrier",
+                "read",
+                [[carrier_id]],
+                {"fields": ["name"]},
+            )
+            if carrier:
+                carrier_name = carrier[0].get("name")
+        except Exception:
+            pass  # Si erreur, on laisse carrier_name à None
+    
+    # Récupérer le prix réel de la ligne de livraison (calculé selon le poids)
     try:
-        records = models.execute_kw(
+        delivery_lines = models.execute_kw(
+            DB,
+            UID,
+            PW,
+            "sale.order.line",
+            "search_read",
+            [["&", ("order_id", "=", order_id), ("is_delivery", "=", True)]],
+            {"fields": ["price_unit", "price_subtotal", "name"], "limit": 1},
+        )
+        if delivery_lines:
+            # Utiliser price_subtotal qui inclut la quantité
+            shipping_cost = delivery_lines[0].get("price_subtotal", 0.0)
+            # Si carrier_name n'a pas été trouvé, utiliser le nom de la ligne
+            if not carrier_name:
+                line_name = delivery_lines[0].get("name", "")
+                # Extraire le nom après "Delivery: " si présent
+                if "Delivery: " in line_name:
+                    carrier_name = line_name.replace("Delivery: ", "")
+                else:
+                    carrier_name = line_name
+    except Exception:
+        pass  # Si erreur, shipping_cost reste à 0.0
+
+
+    
+    # Chercher le picking associé
+    delivery_date = None
+    delivery_status = None
+    picking_name = None
+    
+    try:
+        pickings = models.execute_kw(
             DB,
             UID,
             PW,
             "stock.picking",
             "search_read",
-            [[("sale_id", "=", order_id)]],
-            {"fields": ["id", "name", "scheduled_date", "state"]},
+            [["sale_id", "=", order_id]],
+            {"fields": ["name", "scheduled_date", "state"], "limit": 1},
         )
-    except xmlrpc.client.Fault as fault:
-        fault_string = getattr(fault, "faultString", str(fault))
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while listing deliveries: {fault_string}")
-    except Exception as err:
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while listing deliveries: {err}")
+        if pickings:
+            picking = pickings[0]
+            picking_name = picking.get("name")
+            delivery_status = picking.get("state")
+            
+            # Convertir scheduled_date au format DD/MM/YYYY
+            scheduled_date_str = picking.get("scheduled_date")
+            if scheduled_date_str:
+                try:
+                    # Format Odoo: "2025-12-04 15:40:24"
+                    dt = datetime.strptime(scheduled_date_str, "%Y-%m-%d %H:%M:%S")
+                    delivery_date = dt.strftime("%d/%m/%Y")
+                except ValueError:
+                    delivery_date = scheduled_date_str  # Fallback
+    except Exception:
+        pass  # Si erreur, on laisse les valeurs à None
+    
+    data = {
+        "order_id": order_id,
+        "order_name": order.get("name"),
+        "order_state": order.get("state"),
+        "shipping_method": carrier_name,
+        "shipping_cost": shipping_cost,
+        "delivery_date": delivery_date,
+        "delivery_status": delivery_status,
+        "picking_name": picking_name,
+        "subtotal": order.get("amount_untaxed", 0.0),
+        "total_with_shipping": order.get("amount_total", 0.0),
+    }
+    return _success("Delivery summary retrieved", data)
 
-    return _success("Deliveries retrieved", {"deliveries": records})
-
-
-@app.get("/deliveries/list")
-def list_deliveries():
-    """List deliveries with their current status."""
-    models = _models()
-    try:
-        records = models.execute_kw(
-            DB,
-            UID,
-            PW,
-            "stock.picking",
-            "search_read",
-            [[]],
-            {"fields": ["id", "name", "scheduled_date", "state"]},
-        )
-    except xmlrpc.client.Fault as fault:
-        fault_string = getattr(fault, "faultString", str(fault))
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while listing deliveries: {fault_string}")
-    except Exception as err:
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while listing deliveries: {err}")
-
-    return _success("Deliveries retrieved", {"deliveries": records})
 
 
 # ---------------------------------------------------------------------------
 # Phase 4 – Invoicing
 # ---------------------------------------------------------------------------
-@app.post("/saleorders/{order_id}/invoice", status_code=status.HTTP_201_CREATED)
+@app.post("/saleorders/{order_id}/invoice", status_code=status.HTTP_201_CREATED, tags=["Invoicing"])
 def create_invoice(order_id: int):
     """Create and post a customer invoice for a confirmed sale order."""
     _ensure_positive(order_id, "order_id")
@@ -1048,7 +1254,7 @@ def create_invoice(order_id: int):
     return _success("Invoice created and posted", data)
 
 
-@app.get("/invoices/list")
+@app.get("/invoices/list", tags=["Invoicing"])
 def list_invoices():
     """List all customer invoices."""
     models = _models()
@@ -1098,11 +1304,45 @@ def list_invoices():
     return _success("Invoices retrieved", {"invoices": invoices})
 
 
-@app.get("/invoices/{invoice_id}/pdf")
-def download_invoice_pdf(invoice_id: int):
-    """Download the PDF file of a posted invoice."""
-    _ensure_positive(invoice_id, "invoice_id")
+@app.get("/saleorders/{order_id}/invoice/pdf", tags=["Invoicing"])
+def download_invoice_pdf(order_id: int):
+    """Download the PDF file of a sale order's posted invoice."""
+    _ensure_positive(order_id, "order_id")
     models = _models()
+    
+    # Vérifier que la commande existe
+    order = _fetch_single_record(
+        models,
+        "sale.order",
+        order_id,
+        fields=["name", "state"],
+        not_found_detail=f"Sale order {order_id} not found",
+    )
+    
+    # Trouver la facture associée à cette commande
+    try:
+        invoice_ids = models.execute_kw(
+            DB,
+            UID,
+            PW,
+            "account.move",
+            "search",
+            [["&", ("invoice_origin", "=", order.get("name")), ("state", "=", "posted")]],
+            {"limit": 1},
+        )
+    except xmlrpc.client.Fault as fault:
+        fault_string = getattr(fault, "faultString", str(fault))
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching invoice: {fault_string}")
+    except Exception as err:
+        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching invoice: {err}")
+    
+    if not invoice_ids:
+        _http_error(
+            status.HTTP_404_NOT_FOUND,
+            f"No posted invoice found for sale order {order_id}",
+        )
+    
+    invoice_id = invoice_ids[0]
     
     # Load invoice and verify it exists and is posted
     invoice = _fetch_single_record(
