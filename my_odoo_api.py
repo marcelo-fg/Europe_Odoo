@@ -41,23 +41,59 @@ def connect_odoo(hosturl: str, db: str, user: str, pw: str):
 UID, _COMMON = connect_odoo(URL, DB, USER, PW)
 
 
-class OrderLine(BaseModel):
-    product_id: int
-    quantity: float
-
-
-class QuotationRequest(BaseModel):
-    customer_id: int
-    order_lines: list[OrderLine]
-
 
 class ShippingMethodRequest(BaseModel):
     shipping_method: str  # "home_delivery" ou "pickup"
 
 
 class DeliveryDateRequest(BaseModel):
-    delivery_date: str  # Format: DD/MM/YYYY (ex: "05/12/2025")
+    order_id: int
+    delivery_date: str  # Format: DD/MM/YYYY (ex: "05/12/2025") or YYYY-MM-DD (ex: "2025-12-05")
 
+
+# Enhanced Quotation Models (multi-vehicle with individual services)
+class ServiceLine(BaseModel):
+    """Service à appliquer à un ou plusieurs véhicules."""
+    service_id: int
+    apply_to_quantity: int = 1  # À combien de véhicules appliquer ce service
+    
+    @property
+    def __pydantic_validator__(self):
+        if self.apply_to_quantity <= 0:
+            raise ValueError('apply_to_quantity must be positive')
+        return self
+
+
+class VehicleLine(BaseModel):
+    """Ligne de véhicule avec ses services associés."""
+    vehicle_id: int
+    quantity: int = 1
+    services: list[ServiceLine] = []
+    
+    @property
+    def __pydantic_validator__(self):
+        if self.quantity <= 0:
+            raise ValueError('quantity must be positive')
+        # Vérifier que apply_to_quantity ne dépasse pas la quantité de véhicules
+        for service in self.services:
+            if service.apply_to_quantity > self.quantity:
+                raise ValueError(
+                    f'Service apply_to_quantity ({service.apply_to_quantity}) '
+                    f'cannot exceed vehicle quantity ({self.quantity})'
+                )
+        return self
+
+
+class QuotationRequest(BaseModel):
+    """Requête de création de quotation avec structure améliorée."""
+    customer_id: int
+    vehicle_lines: list[VehicleLine]
+    
+    @property
+    def __pydantic_validator__(self):
+        if not self.vehicle_lines:
+            raise ValueError('At least one vehicle line is required')
+        return self
 
 
 app = FastAPI()
@@ -479,27 +515,32 @@ from typing import Optional
 @app.post("/saleorders/quotation", tags=["Quotations"])
 def create_quotation(
     format: str = "standard",
-    customer_id: Optional[int] = None,
-    vehicle_id: Optional[int] = None,
-    quantity: int = 1,
-    payload: Optional[QuotationRequest] = None
+    payload: QuotationRequest = None
 ):
     """
-    Create a draft sale quotation.
+    Create a quotation with multiple vehicles and individual services.
     
-    Two modes:
-    1. JSON body: {"customer_id": 89, "order_lines": [...]}
-    2. Query params: ?customer_id=89&vehicle_id=184&quantity=1
+    Allows:
+    - Multiple vehicle models in one order
+    - Individual services for specific vehicles
+    - Service application to subset of vehicle quantity
+    
+    Example:
+    {
+      "customer_id": 89,
+      "vehicle_lines": [
+        {
+          "vehicle_id": 184,
+          "quantity": 2,
+          "services": [{"service_id": 201, "apply_to_quantity": 1}]
+        }
+      ]
+    }
     """
-    
-    # Mode query params (Node-RED sans code)
-    if customer_id is not None and vehicle_id is not None:
-        order_lines = [OrderLine(product_id=vehicle_id, quantity=quantity)]
-        payload = QuotationRequest(customer_id=customer_id, order_lines=order_lines)
     
     # Validation
     if payload is None:
-        error_msg = "Missing required parameters. Provide either JSON body or query params (customer_id, vehicle_id)"
+        error_msg = "Missing request body with customer_id and vehicle_lines"
         if format == "nodered":
             return {
                 "status": "error",
@@ -508,7 +549,7 @@ def create_quotation(
             }
         raise HTTPException(status_code=400, detail=error_msg)
     
-    # Validate positive IDs
+    # Validate positive customer_id
     try:
         _ensure_positive(payload.customer_id, "customer_id")
     except HTTPException as e:
@@ -516,15 +557,25 @@ def create_quotation(
             return {"status": "error", "message": str(e.detail), "notification": "✗ Invalid customer_id"}
         raise
     
-    if not payload.order_lines:
+    if not payload.vehicle_lines:
         if format == "nodered":
-            return {"status": "error", "message": "No products selected", "notification": "✗ Please select at least one product"}
-        raise HTTPException(status_code=400, detail="order_lines must contain at least one product")
+            return {"status": "error", "message": "No vehicles selected", "notification": "✗ Please select at least one vehicle"}
+        raise HTTPException(status_code=400, detail="vehicle_lines must contain at least one vehicle")
 
-    for line in payload.order_lines:
+    # Validate all vehicle and service IDs
+    for vehicle_line in payload.vehicle_lines:
         try:
-            _ensure_positive(line.product_id, "product_id")
-            _ensure_positive(line.quantity, "quantity")
+            _ensure_positive(vehicle_line.vehicle_id, "vehicle_id")
+            _ensure_positive(vehicle_line.quantity, "quantity")
+            for service in vehicle_line.services:
+                _ensure_positive(service.service_id, "service_id")
+                _ensure_positive(service.apply_to_quantity, "apply_to_quantity")
+                # Check service quantity doesn't exceed vehicle quantity
+                if service.apply_to_quantity > vehicle_line.quantity:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Service quantity ({service.apply_to_quantity}) cannot exceed vehicle quantity ({vehicle_line.quantity})"
+                    )
         except HTTPException as e:
             if format == "nodered":
                 return {"status": "error", "message": str(e.detail), "notification": "✗ Invalid product or quantity"}
@@ -547,27 +598,84 @@ def create_quotation(
                 return {"status": "error", "message": msg, "notification": f"✗ {msg}"}
             raise HTTPException(status_code=404, detail=msg)
 
-        # Check products exist
-        product_ids = [line.product_id for line in payload.order_lines]
+        # Collect all product IDs (vehicles + services)
+        all_product_ids = []
+        for vehicle_line in payload.vehicle_lines:
+            all_product_ids.append(vehicle_line.vehicle_id)
+            for service in vehicle_line.services:
+                all_product_ids.append(service.service_id)
+        
+        # Check all products exist and get their details
         products_found = models.execute_kw(
             DB, UID, PW,
             "product.product",
-            "search",
-            [[("id", "in", product_ids)]],
+            "search_read",
+            [[("id", "in", all_product_ids)]],
+            {"fields": ["id", "default_code", "name"]},
         )
-        missing_ids = sorted(set(product_ids) - set(products_found))
+        
+        found_ids = {p["id"] for p in products_found}
+        missing_ids = sorted(set(all_product_ids) - found_ids)
         if missing_ids:
             msg = f"Products not found: {', '.join(map(str, missing_ids))}"
             if format == "nodered":
                 return {"status": "error", "message": msg, "notification": "✗ Products not found"}
             raise HTTPException(status_code=404, detail=msg)
+        
+        # Create product lookup dict
+        product_dict = {p["id"]: p for p in products_found}
+        
+        # Validate product types (vehicles should be CAR-*, services should be SERV-*)
+        for vehicle_line in payload.vehicle_lines:
+            vehicle_code = product_dict.get(vehicle_line.vehicle_id, {}).get("default_code", "")
+            if not vehicle_code.startswith("CAR-"):
+                msg = f"Product {vehicle_line.vehicle_id} is not a vehicle (code: {vehicle_code})"
+                if format == "nodered":
+                    return {"status": "error", "message": msg, "notification": "✗ Invalid vehicle"}
+                raise HTTPException(status_code=400, detail=msg)
+            
+            for service in vehicle_line.services:
+                service_code = product_dict.get(service.service_id, {}).get("default_code", "")
+                if not service_code.startswith("SERV-"):
+                    msg = f"Product {service.service_id} is not a service (code: {service_code})"
+                    if format == "nodered":
+                        return {"status": "error", "message": msg, "notification": "✗ Invalid service"}
+                    raise HTTPException(status_code=400, detail=msg)
+
+        # Build order lines for Odoo
+        order_line_entries = []
+        line_details = []  # For response
+        total_vehicles = 0
+        total_services = 0
+        
+        for vehicle_line in payload.vehicle_lines:
+            # Add vehicle line
+            vehicle_name = product_dict[vehicle_line.vehicle_id]["name"]
+            order_line_entries.append(
+                (0, 0, {"product_id": vehicle_line.vehicle_id, "product_uom_qty": vehicle_line.quantity})
+            )
+            line_details.append({
+                "product": vehicle_name,
+                "quantity": vehicle_line.quantity,
+                "type": "vehicle"
+            })
+            total_vehicles += vehicle_line.quantity
+            
+            # Add service lines
+            for service in vehicle_line.services:
+                service_name = product_dict[service.service_id]["name"]
+                order_line_entries.append(
+                    (0, 0, {"product_id": service.service_id, "product_uom_qty": service.apply_to_quantity})
+                )
+                line_details.append({
+                    "product": service_name,
+                    "quantity": service.apply_to_quantity,
+                    "type": "service",
+                    "for_vehicle": vehicle_name
+                })
+                total_services += service.apply_to_quantity
 
         # Create quotation
-        order_line_entries = [
-            (0, 0, {"product_id": line.product_id, "product_uom_qty": line.quantity})
-            for line in payload.order_lines
-        ]
-
         quotation_id = models.execute_kw(
             DB, UID, PW,
             "sale.order",
@@ -611,8 +719,10 @@ def create_quotation(
             "state": info.get("state"),
             "amount_total": amount,
             "amount_formatted": amount_formatted,
-            "line_count": len(payload.order_lines),
-            "notification": f"✓ Quotation {order_name} created! Total: {amount_formatted}"
+            "vehicle_count": total_vehicles,
+            "service_count": total_services,
+            "line_count": len(order_line_entries),
+            "notification": f"✓ Quotation {order_name} created! {total_vehicles} vehicle(s), {total_services} service(s). Total: {amount_formatted}"
         }
     
     # Format standard
@@ -624,9 +734,13 @@ def create_quotation(
             "name": info.get("name"),
             "state": info.get("state"),
             "amount_total": info.get("amount_total"),
-            "line_count": len(payload.order_lines),
+            "vehicle_count": total_vehicles,
+            "service_count": total_services,
+            "line_count": len(order_line_entries),
+            "line_details": line_details,
         }
     }
+
 
 @app.post("/saleorders/{order_id}/cancel", tags=["Sales Orders"])
 def cancel_sale_order(order_id: int):
@@ -902,12 +1016,18 @@ def set_shipping_method(order_id: int, payload: ShippingMethodRequest):
 
 
 
-@app.post("/saleorders/{order_id}/delivery-date", tags=["Delivery"])
-def set_delivery_date(order_id: int, payload: DeliveryDateRequest):
-    """Set delivery date for a sale order (format: DD/MM/YYYY)."""
+@app.post("/saleorders/delivery-date", tags=["Delivery"])
+def set_delivery_date(payload: DeliveryDateRequest):
+    """Set delivery date for a sale order.
+    
+    Accepts:
+    - DD/MM/YYYY (ex: "05/12/2025")
+    - YYYY-MM-DD (ex: "2025-12-05")
+    """
+    order_id = payload.order_id
     _ensure_positive(order_id, "order_id")
     models = _models()
-    
+
     # Vérifier que la commande existe
     order = _fetch_single_record(
         models,
@@ -916,28 +1036,45 @@ def set_delivery_date(order_id: int, payload: DeliveryDateRequest):
         fields=["name", "state"],
         not_found_detail=f"Sale order {order_id} not found",
     )
-    
-    # Valider et convertir le format de date DD/MM/YYYY vers YYYY-MM-DD HH:MM:SS
+
+    raw_date = (payload.delivery_date or "").strip()
+
+    # 1) Essayer format HTML date: YYYY-MM-DD
+    delivery_datetime = None
     try:
-        # Parser la date au format DD/MM/YYYY
-        date_parts = payload.delivery_date.split("/")
-        if len(date_parts) != 3:
-            _http_error(status.HTTP_400_BAD_REQUEST, "Invalid date format. Expected DD/MM/YYYY (ex: 05/12/2025)")
-        
-        day, month, year = date_parts
-        # Créer un objet datetime
-        delivery_datetime = datetime(int(year), int(month), int(day), 10, 0, 0)
-        
-        # Vérifier que la date est dans le futur
-        if delivery_datetime <= datetime.now():
-            _http_error(status.HTTP_400_BAD_REQUEST, "Delivery date must be in the future")
-        
-        # Convertir au format Odoo
-        odoo_date_str = delivery_datetime.strftime("%Y-%m-%d %H:%M:%S")
-        
-    except ValueError as e:
-        _http_error(status.HTTP_400_BAD_REQUEST, f"Invalid date format: {str(e)}. Expected DD/MM/YYYY")
-    
+        if "-" in raw_date and len(raw_date.split("-")) == 3:
+            # ex: 2025-12-14
+            dt = datetime.strptime(raw_date, "%Y-%m-%d")
+            delivery_datetime = datetime(dt.year, dt.month, dt.day, 10, 0, 0)
+    except ValueError:
+        delivery_datetime = None
+
+    # 2) Sinon, essayer format DD/MM/YYYY
+    if delivery_datetime is None:
+        try:
+            parts = raw_date.split("/")
+            if len(parts) != 3:
+                _http_error(
+                    status.HTTP_400_BAD_REQUEST,
+                    "Invalid date format. Expected DD/MM/YYYY (ex: 05/12/2025) "
+                    "or YYYY-MM-DD (ex: 2025-12-05)"
+                )
+            day, month, year = parts
+            delivery_datetime = datetime(int(year), int(month), int(day), 10, 0, 0)
+        except ValueError as e:
+            _http_error(
+                status.HTTP_400_BAD_REQUEST,
+                f"Invalid date format: {str(e)}. "
+                "Expected DD/MM/YYYY or YYYY-MM-DD"
+            )
+
+    # Vérifier que la date est dans le futur
+    if delivery_datetime <= datetime.now():
+        _http_error(status.HTTP_400_BAD_REQUEST, "Delivery date must be in the future")
+
+    # Convertir au format Odoo
+    odoo_date_str = delivery_datetime.strftime("%Y-%m-%d %H:%M:%S")
+
     # Trouver le picking associé à cette commande
     try:
         picking_ids = models.execute_kw(
@@ -946,23 +1083,26 @@ def set_delivery_date(order_id: int, payload: DeliveryDateRequest):
             PW,
             "stock.picking",
             "search",
-            [["&", ("sale_id", "=", order_id), ("state", "in", ["draft", "assigned", "waiting", "confirmed"])]],
+            [["&", ("sale_id", "=", order_id),
+              ("state", "in", ["draft", "assigned", "waiting", "confirmed"])]],
             {"limit": 1},
         )
     except xmlrpc.client.Fault as fault:
         fault_string = getattr(fault, "faultString", str(fault))
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching delivery: {fault_string}")
+        _http_error(status.HTTP_502_BAD_GATEWAY,
+                    f"Odoo error while searching delivery: {fault_string}")
     except Exception as err:
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while searching delivery: {err}")
-    
+        _http_error(status.HTTP_502_BAD_GATEWAY,
+                    f"Odoo error while searching delivery: {err}")
+
     if not picking_ids:
         _http_error(
             status.HTTP_404_NOT_FOUND,
             f"No delivery found for sale order {order_id}. Please confirm the order first.",
         )
-    
+
     picking_id = picking_ids[0]
-    
+
     # Mettre à jour la scheduled_date du picking
     try:
         models.execute_kw(
@@ -975,13 +1115,15 @@ def set_delivery_date(order_id: int, payload: DeliveryDateRequest):
         )
     except xmlrpc.client.Fault as fault:
         fault_string = getattr(fault, "faultString", str(fault))
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while updating delivery date: {fault_string}")
+        _http_error(status.HTTP_502_BAD_GATEWAY,
+                    f"Odoo error while updating delivery date: {fault_string}")
     except Exception as err:
-        _http_error(status.HTTP_502_BAD_GATEWAY, f"Odoo error while updating delivery date: {err}")
-    
+        _http_error(status.HTTP_502_BAD_GATEWAY,
+                    f"Odoo error while updating delivery date: {err}")
+
     data = {
         "order_id": order_id,
-        "delivery_date": payload.delivery_date,
+        "delivery_date": raw_date,
         "scheduled_date_odoo": odoo_date_str,
         "picking_id": picking_id,
     }
