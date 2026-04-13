@@ -28,5 +28,3 @@ Run the FastAPI application:
 uvicorn my_odoo_api:app --reload
 ```
 
----
-*Professional portfolio repository*
